@@ -1,0 +1,55 @@
+# crawler/storage/baseline_store.py
+
+from pathlib import Path
+from crawler.storage.db import insert_defacement_site
+from crawler.storage.mysql import upsert_baseline_hash
+from crawler.normalizer import normalize_html
+from crawler.hasher import sha256
+
+BASELINE_ROOT = Path("baselines")
+
+
+def _next_baseline_id(site_dir: Path, siteid: int) -> str:
+    max_seq = 0
+    prefix = f"{siteid}-"
+
+    for f in site_dir.glob(f"{siteid}-*.html"):
+        stem = f.stem
+        if stem.startswith(prefix):
+            try:
+                max_seq = max(max_seq, int(stem[len(prefix):]))
+            except ValueError:
+                pass
+
+    return f"{siteid}-{max_seq + 1}"
+
+
+def store_snapshot_file(*, custid, siteid, url, html, crawl_mode):
+    site_dir = BASELINE_ROOT / str(custid) / str(siteid)
+    site_dir.mkdir(parents=True, exist_ok=True)
+
+    baseline_id = _next_baseline_id(site_dir, siteid)
+    path = site_dir / f"{baseline_id}.html"
+    path.write_text(html.strip(), encoding="utf-8")
+
+    if crawl_mode.upper() == "BASELINE":
+        insert_defacement_site(
+            siteid=siteid,
+            baseline_id=baseline_id,
+            url=url,
+        )
+
+    return baseline_id, path.name, str(path)
+
+
+def store_baseline_hash(*, site_id, normalized_url, raw_html, baseline_path):
+    content_hash = sha256(normalize_html(raw_html))
+
+    upsert_baseline_hash(
+        site_id=site_id,
+        normalized_url=normalized_url,
+        content_hash=content_hash,
+        baseline_path=baseline_path,
+    )
+
+    return content_hash
