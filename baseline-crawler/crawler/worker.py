@@ -1,0 +1,221 @@
+# crawler/worker.py
+import threading
+import time
+import re
+from collections import defaultdict
+from urllib.parse import urlparse
+from datetime import datetime, timezone
+
+from crawler.fetcher import fetch
+from crawler.parser import extract_urls
+from crawler.normalizer import (
+    normalize_rendered_html,
+    normalize_url,
+)
+from crawler.storage.db import insert_crawl_page
+from crawler.storage.baseline_store import (
+    store_snapshot_file,
+    store_baseline_hash,
+)
+from crawler.compare_engine import CompareEngine
+
+from crawler.js_detect import needs_js_rendering
+
+from crawler.render_cache import get_cached_render, set_cached_render
+from crawler.js_render_worker import JSRenderWorker
+JS_RENDERER = JSRenderWorker()
+
+
+# ==================================================
+# BLOCK RULES
+# ==================================================
+
+PATH_BLOCK_RULES = {
+    "TAG_PAGE": r"^/tag/",
+    "AUTHOR_PAGE": r"^/author/",
+    "PAGINATION": r"/page/\d*/?$",
+}
+
+STATIC_EXTENSIONS = (
+    ".css", ".js", ".png", ".jpg", ".jpeg",
+    ".gif", ".svg", ".ico", ".pdf", ".zip"
+)
+
+BLOCK_REPORT = defaultdict(list)
+BLOCK_LOCK = threading.Lock()
+
+
+def classify_block(url: str):
+    parsed = urlparse(url)
+    if parsed.path.endswith(STATIC_EXTENSIONS):
+        return "STATIC"
+    for k, r in PATH_BLOCK_RULES.items():
+        if re.search(r, parsed.path.lower()):
+            return k
+    return None
+
+
+# ==================================================
+# STRICT DOMAIN FILTER
+# ==================================================
+
+def _allowed_domain(seed_url: str, candidate_url: str) -> bool:
+    seed_netloc = urlparse(seed_url).netloc.lower().split(":")[0]
+    cand_netloc = urlparse(candidate_url).netloc.lower().split(":")[0]
+
+    base = seed_netloc[4:] if seed_netloc.startswith("www.") else seed_netloc
+    return cand_netloc == base or cand_netloc == f"www.{base}"
+
+
+# ==================================================
+# WORKER
+# ==================================================
+
+class Worker(threading.Thread):
+    def __init__(
+        self,
+        frontier,
+        name,
+        custid,
+        siteid_map,
+        job_id,
+        crawl_mode,
+        seed_url,
+    ):
+        super().__init__(name=name)
+        self.frontier = frontier
+        self.running = True
+        self.custid = custid
+        self.siteid = next(iter(siteid_map.values()))
+        self.job_id = job_id
+        self.crawl_mode = crawl_mode
+        self.seed_url = seed_url
+
+        self.compare_engine = (
+            CompareEngine(custid=self.custid)
+            if crawl_mode == "COMPARE"
+            else None
+        )
+
+    def run(self):
+        print(f"[{self.name}] started ({self.crawl_mode})")
+
+        while self.running:
+            (item, got_task) = self.frontier.dequeue()
+
+            if not got_task:
+                time.sleep(0.1)
+                continue
+
+            url, parent, depth = item
+            start = time.time()
+
+            try:
+                print(f"[{self.name}] Crawling {url}")
+
+                result = fetch(url, parent, depth)
+                fetched_at = datetime.now(timezone.utc)
+
+                if not result["success"]:
+                    print(f"[{self.name}] Fetch failed for {url}: {result.get('error', 'unknown')}")
+                    continue
+
+                resp = result["response"]
+                ct = resp.headers.get("Content-Type", "")
+
+                insert_crawl_page({
+                    "job_id": self.job_id,
+                    "custid": self.custid,
+                    "siteid": self.siteid,
+                    "url": url,
+                    "parent_url": parent,
+                    "depth": depth,
+                    "status_code": resp.status_code,
+                    "content_type": ct,
+                    "content_length": len(resp.content),
+                    "response_time_ms": int((time.time() - start) * 1000),
+                    "fetched_at": fetched_at,
+                })
+
+                if "text/html" not in ct.lower():
+                    continue
+
+                # ---------------- HTML HANDLING ----------------
+                html = resp.text
+
+                # 🔒 ALWAYS ensure final HTML before extracting URLs
+                if needs_js_rendering(html):
+                    cached = get_cached_render(url)
+                    if cached:
+                        html = cached
+                    else:
+                        print(f"[{self.name}] JS rendering {url}")
+                        html = JS_RENDERER.render(url)
+                        set_cached_render(url, html)
+
+
+                # 🔒 Extract URLs ONLY after JS handling
+                urls, _ = extract_urls(html, url)
+
+                if not urls:
+                    print(f"[{self.name}] ⚠️  No URLs extracted from {url}")
+                    print(f"[{self.name}]    HTML size: {len(html)} bytes")
+                    print(f"[{self.name}]    Possible cause: JS-rendered content or minimal links")
+                else:
+                    print(f"[{self.name}] Extracted {len(urls)} URLs from {url}")
+
+                # ---------------- MODE LOGIC ----------------
+                if self.crawl_mode == "BASELINE":
+                    baseline_id, _, path = store_snapshot_file(
+                        custid=self.custid,
+                        siteid=self.siteid,
+                        url=url,
+                        html=html,
+                        crawl_mode="BASELINE",
+                    )
+
+                    store_baseline_hash(
+                        site_id=self.siteid,
+                        normalized_url=normalize_url(url),
+                        raw_html=html,
+                        baseline_path=path,
+                    )
+
+                elif self.crawl_mode == "COMPARE":
+                    self.compare_engine.handle_page(
+                        siteid=self.siteid,
+                        url=url,
+                        html=html,
+                    )
+
+                # ---------------- ENQUEUE ----------------
+                enqueued_count = 0
+                for u in urls:
+                    if classify_block(u):
+                        with BLOCK_LOCK:
+                            BLOCK_REPORT["BLOCK_RULE"].append(u)
+                        print(f"[{self.name}] Blocked (rule): {u}")
+                        continue
+
+                    if not _allowed_domain(self.seed_url, u):
+                        with BLOCK_LOCK:
+                            BLOCK_REPORT["DOMAIN_FILTER"].append(u)
+                        print(f"[{self.name}] Blocked (domain): {u}")
+                        continue
+
+                    self.frontier.enqueue(u, url, depth + 1)
+                    enqueued_count += 1
+
+                if enqueued_count > 0:
+                    print(f"[{self.name}] Enqueued {enqueued_count} URLs")
+
+            except Exception as e:
+                import traceback
+                print(f"[{self.name}] ERROR {url}: {e}")
+                print(f"[{self.name}] Traceback: {traceback.format_exc()}")
+
+            finally:
+                self.frontier.mark_visited(url, got_task=got_task)
+
+    def stop(self):
+        self.running = False
